@@ -13,32 +13,52 @@ import type {
   User,
   UserRole,
 } from '../types';
+import { localFallbackStore } from './localFallbackStore';
 
-async function request<T>(url: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(url, {
-    headers: { 'Content-Type': 'application/json', ...(options?.headers || {}) },
-    ...options,
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw new Error(data.error || 'Ocurrió un error al comunicarse con el servidor.');
+async function requestWithFallback<T>(
+  url: string,
+  options: RequestInit | undefined,
+  fallback: () => T
+): Promise<T> {
+  try {
+    const res = await fetch(url, {
+      headers: { 'Content-Type': 'application/json', ...(options?.headers || {}) },
+      ...options,
+    });
+    const contentType = res.headers.get('content-type') || '';
+    if (!contentType.includes('application/json')) {
+      // Static host (e.g. Cloudflare Pages) returned HTML or 404 page instead of Express JSON
+      return fallback();
+    }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.error || 'Ocurrió un error al comunicarse con el servidor.');
+    }
+    return data as T;
+  } catch (err) {
+    // Only fall back on network errors or missing static backend, not explicit 4xx validation errors
+    if (err instanceof TypeError) {
+      return fallback();
+    }
+    throw err;
   }
-  return data as T;
 }
 
 export const api = {
   // Auth
   login: (email: string, password: string) =>
-    request<{ user: User }>('/api/auth/login', {
-      method: 'POST',
-      body: JSON.stringify({ email, password }),
-    }),
+    requestWithFallback<{ user: User }>(
+      '/api/auth/login',
+      { method: 'POST', body: JSON.stringify({ email, password }) },
+      () => localFallbackStore.login(email, password)
+    ),
 
   loginDemo: (role: UserRole) =>
-    request<{ user: User }>('/api/auth/demo', {
-      method: 'POST',
-      body: JSON.stringify({ role }),
-    }),
+    requestWithFallback<{ user: User }>(
+      '/api/auth/demo',
+      { method: 'POST', body: JSON.stringify({ role }) },
+      () => localFallbackStore.loginDemo(role)
+    ),
 
   register: (payload: {
     name: string;
@@ -48,16 +68,18 @@ export const api = {
     phone: string;
     city: string;
   }) =>
-    request<{ user: User }>('/api/auth/register', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    }),
+    requestWithFallback<{ user: User }>(
+      '/api/auth/register',
+      { method: 'POST', body: JSON.stringify(payload) },
+      () => localFallbackStore.register(payload)
+    ),
 
   recoverPassword: (email: string) =>
-    request<{ sent: boolean; message: string }>('/api/auth/recover', {
-      method: 'POST',
-      body: JSON.stringify({ email }),
-    }),
+    requestWithFallback<{ sent: boolean; message: string }>(
+      '/api/auth/recover',
+      { method: 'POST', body: JSON.stringify({ email }) },
+      () => localFallbackStore.recoverPassword(email)
+    ),
 
   // Accommodations
   listAccommodations: (
@@ -81,13 +103,19 @@ export const api = {
     if (filters?.includeAllStatuses) params.set('includeAllStatuses', 'true');
 
     const query = params.toString();
-    return request<{ accommodations: Accommodation[] }>(
-      `/api/accommodations${query ? `?${query}` : ''}`
+    return requestWithFallback<{ accommodations: Accommodation[] }>(
+      `/api/accommodations${query ? `?${query}` : ''}`,
+      undefined,
+      () => localFallbackStore.listAccommodations(filters)
     );
   },
 
   getAccommodation: (idOrSlug: string) =>
-    request<{ accommodation: AccommodationDetail }>(`/api/accommodations/${idOrSlug}`),
+    requestWithFallback<{ accommodation: AccommodationDetail }>(
+      `/api/accommodations/${idOrSlug}`,
+      undefined,
+      () => localFallbackStore.getAccommodation(idOrSlug)
+    ),
 
   createAccommodation: (payload: {
     ownerId: string;
@@ -104,10 +132,11 @@ export const api = {
     bathrooms: number;
     amenities: string[];
   }) =>
-    request<{ accommodation: Accommodation }>('/api/accommodations', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    }),
+    requestWithFallback<{ accommodation: Accommodation }>(
+      '/api/accommodations',
+      { method: 'POST', body: JSON.stringify(payload) },
+      () => localFallbackStore.createAccommodation(payload)
+    ),
 
   updateAccommodation: (
     id: string,
@@ -124,30 +153,27 @@ export const api = {
       verified: boolean;
     }>
   ) =>
-    request<{ accommodation: Accommodation }>(`/api/accommodations/${id}`, {
-      method: 'PATCH',
-      body: JSON.stringify(patch),
-    }),
+    requestWithFallback<{ accommodation: Accommodation }>(
+      `/api/accommodations/${id}`,
+      { method: 'PATCH', body: JSON.stringify(patch) },
+      () => localFallbackStore.updateAccommodation(id, patch)
+    ),
 
   toggleBlockedDate: (accommodationId: string, date: string) =>
-    request<{ accommodation: AccommodationDetail }>(
+    requestWithFallback<{ accommodation: AccommodationDetail }>(
       `/api/accommodations/${accommodationId}/availability`,
-      {
-        method: 'POST',
-        body: JSON.stringify({ date }),
-      }
+      { method: 'POST', body: JSON.stringify({ date }) },
+      () => localFallbackStore.toggleBlockedDate(accommodationId, date)
     ),
 
   addReview: (
     accommodationId: string,
     payload: { authorName: string; authorCity: string; rating: number; comment: string }
   ) =>
-    request<{ review: Review; accommodation: AccommodationDetail }>(
+    requestWithFallback<{ review: Review; accommodation: AccommodationDetail }>(
       `/api/accommodations/${accommodationId}/reviews`,
-      {
-        method: 'POST',
-        body: JSON.stringify(payload),
-      }
+      { method: 'POST', body: JSON.stringify(payload) },
+      () => localFallbackStore.addReview(accommodationId, payload)
     ),
 
   // Bookings
@@ -156,7 +182,11 @@ export const api = {
     if (filter?.touristId) params.set('touristId', filter.touristId);
     if (filter?.ownerId) params.set('ownerId', filter.ownerId);
     const q = params.toString();
-    return request<{ bookings: Booking[] }>(`/api/bookings${q ? `?${q}` : ''}`);
+    return requestWithFallback<{ bookings: Booking[] }>(
+      `/api/bookings${q ? `?${q}` : ''}`,
+      undefined,
+      () => localFallbackStore.listBookings(filter)
+    );
   },
 
   createBooking: (payload: {
@@ -173,25 +203,38 @@ export const api = {
     guestsCount: number;
     paymentMethod: PaymentMethod;
   }) =>
-    request<{ booking: Booking }>('/api/bookings', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    }),
+    requestWithFallback<{ booking: Booking }>(
+      '/api/bookings',
+      { method: 'POST', body: JSON.stringify(payload) },
+      () => localFallbackStore.createBooking(payload)
+    ),
 
   updateBooking: (id: string, patch: { status?: BookingStatus; paymentStatus?: PaymentStatus }) =>
-    request<{ booking: Booking }>(`/api/bookings/${id}`, {
-      method: 'PATCH',
-      body: JSON.stringify(patch),
-    }),
+    requestWithFallback<{ booking: Booking }>(
+      `/api/bookings/${id}`,
+      { method: 'PATCH', body: JSON.stringify(patch) },
+      () => localFallbackStore.updateBooking(id, patch)
+    ),
 
   // Admin
-  getAdminOverview: () => request<{ overview: AdminOverview }>('/api/admin/overview'),
+  getAdminOverview: () =>
+    requestWithFallback<{ overview: AdminOverview }>(
+      '/api/admin/overview',
+      undefined,
+      () => localFallbackStore.getAdminOverview()
+    ),
 
-  listUsers: () => request<{ users: User[] }>('/api/users'),
+  listUsers: () =>
+    requestWithFallback<{ users: User[] }>(
+      '/api/users',
+      undefined,
+      () => localFallbackStore.listUsers()
+    ),
 
   updateUser: (id: string, patch: { active?: boolean; role?: UserRole }) =>
-    request<{ user: User }>(`/api/users/${id}`, {
-      method: 'PATCH',
-      body: JSON.stringify(patch),
-    }),
+    requestWithFallback<{ user: User }>(
+      `/api/users/${id}`,
+      { method: 'PATCH', body: JSON.stringify(patch) },
+      () => localFallbackStore.updateUser(id, patch)
+    ),
 };
